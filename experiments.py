@@ -33,7 +33,6 @@ def _sample_loop(pipe, model_name, dataset_samples, use_caption, config, encode_
             prompt_data = encode_fn(caption)
             raw_latents = pipe.vae.encode(image).latent_dist.sample()
             latents = prepare_latents_fn(raw_latents)
-            noise = torch.randn_like(latents)
 
             for t_idx in config.t_indices:
                 t_idx_int = t_idx.item()
@@ -41,13 +40,17 @@ def _sample_loop(pipe, model_name, dataset_samples, use_caption, config, encode_
                 timestep = pipe.scheduler.timesteps[t_idx_int]
 
                 for size in config.compression_sizes:
+                    noise = torch.randn_like(latents)
                     noisy = (1 - sigma) * compress_fn(latents, size) + sigma * noise
                     target = noise - latents
                     vel = prompt_data(noisy, timestep)
-                    latent_pred = (noisy - vel * sigma) / (1 - sigma)
+                    latent_pred = noisy - vel * sigma
+                    noise_pred = noisy + vel * (1 - sigma)
 
                     compressed = compress_fn(latent_pred, size)
-                    vel_results[t_idx_int][size].append(F.mse_loss(noise - compressed, target).item())
+                    # using the clean noise yields results very similar to only predicting the clean latents
+                    # as the compression removes most of the noise
+                    vel_results[t_idx_int][size].append(F.mse_loss(noise_pred - compressed, target).item())
                     lat_results[t_idx_int][size].append(F.mse_loss(compressed, latents).item())
     return {"velocity": vel_results, "latent": lat_results}
 
