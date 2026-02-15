@@ -21,9 +21,6 @@ t_indices = torch.linspace(0, num_inference_steps - 1, 20).long()
 
 experiment_configs = [
     ("sd3", False),
-    ("sd3", True),
     ("flux", False),
-    ("flux", True),
     ("auraflow", False),
-    ("auraflow", True),
 ]
