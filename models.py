@@ -3,17 +3,26 @@ import torch.nn.functional as F
 from diffusers import StableDiffusion3Pipeline, FluxPipeline, AuraFlowPipeline
 
 
-def apply_spatial_compression(predicted_x0, target_size):
+def apply_spatial_compression(predicted_x0, target_size, packed_shape=None):
     """
     Downsample and upsample the predicted clean image.
 
     Args:
-        predicted_x0: Predicted clean latent [B, C, H, W]
+        predicted_x0: Predicted clean latent [B, C, H, W] or [B, N, C] if packed
         target_size: Target spatial size (int)
+        packed_shape: If provided, a (h, w) tuple indicating the latent spatial dims.
+                      The input is unpacked from [B, N, C] to [B, ch, h, w] before
+                      compression and repacked afterwards.
 
     Returns:
         Compressed and upsampled predicted_x0
     """
+    if packed_shape is not None:
+        h, w = packed_shape
+        B, N, C = predicted_x0.shape
+        ch = C // 4
+        predicted_x0 = predicted_x0.view(B, h//2, w//2, ch, 2, 2).permute(0,3,1,4,2,5).reshape(B, ch, h, w)
+
     target_size = (target_size, target_size)
     original_size = predicted_x0.shape[2:]
 
@@ -31,6 +40,9 @@ def apply_spatial_compression(predicted_x0, target_size):
         mode='bilinear',
         align_corners=False
     )
+
+    if packed_shape is not None:
+        upsampled = upsampled.view(B, ch, h//2, 2, w//2, 2).permute(0,2,4,1,3,5).reshape(B, N, C)
 
     return upsampled
 
