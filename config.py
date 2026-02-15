@@ -14,7 +14,7 @@ height = 512
 width = 512
 num_inference_steps = 50
 compression_sizes = [64, 56, 48, 32, 16, 8, 4, 2, 1]
-num_samples = 32
+num_samples = 64
 
 # 20 evenly spaced timestep indices
 t_indices = torch.linspace(0, num_inference_steps - 1, 20).long()
