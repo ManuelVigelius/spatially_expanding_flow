@@ -5,8 +5,12 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 from tqdm import tqdm
+import pickle
+from datasets import load_dataset
 
 from models import load_model, encode_prompt_for_model, apply_spatial_compression
+import config
+
 
 
 def _process_sample(sample, use_caption, width, height, device, dtype):
@@ -139,3 +143,17 @@ def run_all_experiments(experiment_configs, dataset_samples, config):
             torch.cuda.empty_cache()
     print("\nAll experiments completed!")
     return all_results
+
+def main():
+    dataset = load_dataset("detection-datasets/coco", split="val")
+
+    dataset_samples = list(dataset.select(range(config.num_samples)))
+    all_experiment_results = run_all_experiments(config.experiment_configs, dataset_samples, config)
+
+    # Save (convert defaultdicts to regular dicts for pickling)
+    saveable = {k: {m: dict(v) for m, v in metrics.items()} for k, metrics in all_experiment_results.items()}
+    with open(config.results_path, "wb") as f:
+        pickle.dump(saveable, f)
+
+if __name__ == '__main__':
+    main()

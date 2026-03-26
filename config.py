@@ -24,3 +24,5 @@ experiment_configs = [
     ("flux", False),
     ("auraflow", False),
 ]
+
+results_path = "all_experiment_results.pkl"
