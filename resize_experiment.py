@@ -35,10 +35,11 @@ else:
 
 num_inference_steps = 50
 num_samples = 64
+batch_size = 4
 t_indices = torch.linspace(0, num_inference_steps - 1, 20).long()
 
-# All multiples of 8 from 8 to 512
-image_sizes = list(range(8, 513, 8))
+# All multiples of 16 from 16 to 512
+image_sizes = list(range(16, 513, 16))
 
 RESULTS_PATH = "resize_experiment_results.pkl"
 
@@ -55,16 +56,30 @@ def _process_sample(sample, size):
     return image
 
 
+def _encode_samples(pipe, samples, size, sf, sc):
+    """VAE-encode a list of samples at `size`, return (latents, ref_pixels) batched."""
+    images = torch.cat([_process_sample(s, size) for s in samples], dim=0)
+    latents = (pipe.vae.encode(images).latent_dist.sample() - sf) * sc
+    if size == 512:
+        ref_pixels = pipe.vae.decode(latents / sc + sf).sample
+    else:
+        ref_pixels = None
+    return latents, ref_pixels
+
+
 def run_resize_experiment(pipe, dataset_samples):
     """
-    For every image size and every timestep, encode the image at that size,
-    add noise, run SD3, and record:
-      - velocity MSE  (in latent space)
-      - latent MSE    (predicted latent vs. ground-truth latent, both at native size)
-      - image MSE     (predicted image bilinearly upsampled to 512 vs. ground-truth image at 512)
+    For every image size and every timestep, encode a batch of images at that
+    size, add noise, run SD3, and record:
+      - velocity MSE   (in latent space)
+      - latent MSE     (predicted latent vs. ground-truth latent, both at native size)
+      - pixel MSE      (predicted image decoded and bilinearly upsampled to 512 vs. ground-truth image at 512)
+      - upsampled_latent MSE  (predicted latent bilinearly upsampled to 512-latent size vs. ground-truth latents at 512)
+
+    Samples are processed in batches of `batch_size` to utilise the GPU better.
 
     Returns:
-        dict with keys "velocity", "latent", "image", each mapping
+        dict with keys "velocity", "latent", "pixel", "upsampled_latent", each mapping
         size -> t_idx -> list[float]
     """
     pipe.scheduler.set_timesteps(num_inference_steps)
@@ -72,30 +87,40 @@ def run_resize_experiment(pipe, dataset_samples):
 
     vel_results = defaultdict(lambda: defaultdict(list))
     lat_results = defaultdict(lambda: defaultdict(list))
-    img_results = defaultdict(lambda: defaultdict(list))
+    pix_results = defaultdict(lambda: defaultdict(list))
+    upl_results = defaultdict(lambda: defaultdict(list))
 
-    # VAE scale/shift helpers
     sf = pipe.vae.config.shift_factor
     sc = pipe.vae.config.scaling_factor
 
-    for sample in tqdm(dataset_samples, desc="SD3 resize experiment"):
+    batches = [
+        dataset_samples[i : i + batch_size]
+        for i in range(0, len(dataset_samples), batch_size)
+    ]
+
+    # Encode empty prompt once — same for all samples/sizes/timesteps
+    with torch.no_grad():
+        prompt_embeds_1, pooled_1 = encode_prompt_for_model(pipe, "sd3", "", device, dtype)
+
+    for size in tqdm(image_sizes, desc="SD3 resize experiment"):
         with torch.no_grad():
-            # Ground-truth image and decoded pixels at full 512x512 resolution
-            image_512 = _process_sample(sample, 512)
-            raw_512 = pipe.vae.encode(image_512).latent_dist.sample()
-            # Decode reference once: used for image-space MSE
-            ref_pixels = pipe.vae.decode((raw_512 - sf) * sc).sample  # [1, 3, 512, 512]
+            for batch in batches:
+                B = len(batch)
 
-            # Encode empty prompt once per sample (same for all sizes/timesteps)
-            prompt_embeds, pooled = encode_prompt_for_model(
-                pipe, "sd3", "", device, dtype
-            )
+                latents, ref_pixels = _encode_samples(pipe, batch, size, sf, sc)
 
-            for size in image_sizes:
-                image = _process_sample(sample, size)
+                # Reference pixels and 512 latents; re-use across timesteps
+                if ref_pixels is None:
+                    images_512 = torch.cat([_process_sample(s, 512) for s in batch], dim=0)
+                    ref_latents = (pipe.vae.encode(images_512).latent_dist.sample() - sf) * sc
+                    ref_pixels = pipe.vae.decode(ref_latents / sc + sf).sample  # [B, 3, 512, 512]
+                else:
+                    # size == 512: latents are already at full resolution
+                    ref_latents = latents
 
-                raw_latents = pipe.vae.encode(image).latent_dist.sample()
-                latents = (raw_latents - sf) * sc
+                # Tile prompt embeddings to match batch size
+                prompt_embeds = prompt_embeds_1.expand(B, -1, -1)
+                pooled = pooled_1.expand(B, -1)
 
                 for t_idx in t_indices:
                     t_idx_int = t_idx.item()
@@ -108,7 +133,7 @@ def run_resize_experiment(pipe, dataset_samples):
 
                     vel = pipe.transformer(
                         hidden_states=noisy,
-                        timestep=timestep.unsqueeze(0).to(device),
+                        timestep=timestep.expand(B).to(device),
                         encoder_hidden_states=prompt_embeds,
                         pooled_projections=pooled,
                         return_dict=False,
@@ -117,24 +142,38 @@ def run_resize_experiment(pipe, dataset_samples):
                     latent_pred = noisy - vel * sigma
                     noise_pred = noisy + vel * (1 - sigma)
 
-                    vel_results[size][t_idx_int].append(
-                        F.mse_loss(noise_pred, target).item()
-                    )
-                    lat_results[size][t_idx_int].append(
-                        F.mse_loss(latent_pred, latents).item()
-                    )
+                    # Per-sample MSE (reduce over all dims except batch)
+                    for b in range(B):
+                        vel_results[size][t_idx_int].append(
+                            F.mse_loss(noise_pred[b], target[b]).item()
+                        )
+                        lat_results[size][t_idx_int].append(
+                            F.mse_loss(latent_pred[b], latents[b]).item()
+                        )
 
-                    # Decode predicted latents, upsample to 512, compare to reference
                     pred_pixels = pipe.vae.decode(latent_pred / sc + sf).sample
                     if size != 512:
                         pred_pixels = F.interpolate(
                             pred_pixels, size=(512, 512), mode="bilinear", align_corners=False
                         )
-                    img_results[size][t_idx_int].append(
-                        F.mse_loss(pred_pixels, ref_pixels).item()
-                    )
+                    for b in range(B):
+                        pix_results[size][t_idx_int].append(
+                            F.mse_loss(pred_pixels[b], ref_pixels[b]).item()
+                        )
 
-    return {"velocity": vel_results, "latent": lat_results, "image": img_results}
+                    latent_spatial = ref_latents.shape[2:]
+                    if size != 512:
+                        upsampled_pred = F.interpolate(
+                            latent_pred, size=latent_spatial, mode="bilinear", align_corners=False
+                        )
+                    else:
+                        upsampled_pred = latent_pred
+                    for b in range(B):
+                        upl_results[size][t_idx_int].append(
+                            F.mse_loss(upsampled_pred[b], ref_latents[b]).item()
+                        )
+
+    return {"velocity": vel_results, "latent": lat_results, "pixel": pix_results, "upsampled_latent": upl_results}
 
 
 # --------------------------------------------------------------------------- #
@@ -153,7 +192,7 @@ def main():
 
     # Convert defaultdicts to regular dicts for pickling
     def to_dict(d):
-        if isinstance(d, defaultdict):
+        if isinstance(d, (dict, defaultdict)):
             return {k: to_dict(v) for k, v in d.items()}
         return d
 
