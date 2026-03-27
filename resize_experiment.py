@@ -35,13 +35,18 @@ else:
 
 num_inference_steps = 50
 num_samples = 64
-batch_size = 4
+batch_size = 32
 t_indices = torch.linspace(0, num_inference_steps - 1, 20).long()
 
 # All multiples of 16 from 16 to 512
 image_sizes = list(range(16, 513, 16))
 
-RESULTS_PATH = "resize_experiment_results.pkl"
+SCALE_SIGMA_BY_SIZE = True
+RESULTS_PATH = (
+    "resize_experiment_results_scaled_sigma.pkl"
+    if SCALE_SIGMA_BY_SIZE
+    else "resize_experiment_results.pkl"
+)
 
 
 # --------------------------------------------------------------------------- #
@@ -125,6 +130,9 @@ def run_resize_experiment(pipe, dataset_samples):
                 for t_idx in t_indices:
                     t_idx_int = t_idx.item()
                     sigma = pipe.scheduler.sigmas[t_idx_int].to(dtype=dtype)
+                    if SCALE_SIGMA_BY_SIZE:
+                        r = size / 512
+                        sigma = (r * sigma) / (r * sigma + (1 - sigma))
                     timestep = pipe.scheduler.timesteps[t_idx_int]
 
                     noise = torch.randn_like(latents)
