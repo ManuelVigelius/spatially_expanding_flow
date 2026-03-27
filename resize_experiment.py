@@ -148,12 +148,10 @@ def run_resize_experiment(pipe, dataset_samples):
                     )[0]
 
                     latent_pred = noisy - vel * sigma
-                    noise_pred = noisy + vel * (1 - sigma)
-
                     # Per-sample MSE (reduce over all dims except batch)
                     for b in range(B):
                         vel_results[size][t_idx_int].append(
-                            F.mse_loss(noise_pred[b], target[b]).item()
+                            F.mse_loss(vel[b], target[b]).item()
                         )
                         lat_results[size][t_idx_int].append(
                             F.mse_loss(latent_pred[b], latents[b]).item()
