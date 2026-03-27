@@ -162,7 +162,7 @@ def run_resize_experiment(pipe, dataset_samples):
                     pred_pixels = pipe.vae.decode(latent_pred / sc + sf).sample
                     if size != 512:
                         pred_pixels = F.interpolate(
-                            pred_pixels, size=(512, 512), mode="bilinear", align_corners=False
+                            pred_pixels, size=(512, 512), mode="bilinear", align_corners=True
                         )
                     for b in range(B):
                         pix_results[size][t_idx_int].append(
@@ -172,7 +172,7 @@ def run_resize_experiment(pipe, dataset_samples):
                     latent_spatial = ref_latents.shape[2:]
                     if size != 512:
                         upsampled_pred = F.interpolate(
-                            latent_pred, size=latent_spatial, mode="bilinear", align_corners=False
+                            latent_pred, size=latent_spatial, mode="bilinear", align_corners=True
                         )
                     else:
                         upsampled_pred = latent_pred
