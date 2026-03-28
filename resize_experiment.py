@@ -133,7 +133,7 @@ def run_resize_experiment(pipe, dataset_samples):
                     if SCALE_SIGMA_BY_SIZE:
                         r = size / 512
                         sigma = (r * sigma) / (r * sigma + (1 - sigma))
-                    timestep = pipe.scheduler.timesteps[t_idx_int]
+                    timestep = (sigma * 1000).unsqueeze(0).expand(B).to(device)
 
                     noise = torch.randn_like(latents)
                     noisy = (1 - sigma) * latents + sigma * noise
@@ -141,7 +141,7 @@ def run_resize_experiment(pipe, dataset_samples):
 
                     vel = pipe.transformer(
                         hidden_states=noisy,
-                        timestep=timestep.expand(B).to(device),
+                        timestep=timestep,
                         encoder_hidden_states=prompt_embeds,
                         pooled_projections=pooled,
                         return_dict=False,

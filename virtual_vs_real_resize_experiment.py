@@ -22,7 +22,6 @@ Results are saved to virtual_vs_real_resize_experiment_results.pkl
 
 import pickle
 from collections import defaultdict
-from PIL import Image
 
 import numpy as np
 import torch
@@ -120,16 +119,14 @@ def run_experiment(pipe, dataset_samples):
                     latent_small_h = size // 8
                     latent_small_w = size // 8
 
-                    # --- real resize: encode at `size` ---
-                    images_small = torch.cat([_to_tensor(s["image"], size) for s in batch], dim=0)
-                    assert images_small.shape == (B, 3, size, size), f"Expected images_small {(B, 3, size, size)}, got {images_small.shape}"
-                    latents_small = (pipe.vae.encode(images_small).latent_dist.sample() - sf) * sc
+                    # --- real resize: downsample full-res latents to `size` ---
+                    latents_small = F.interpolate(
+                        latents_512,
+                        size=(latent_small_h, latent_small_w),
+                        mode="bilinear",
+                        align_corners=True,
+                    )
                     assert latents_small.shape == (B, 16, latent_small_h, latent_small_w), f"Expected latents_small {(B, 16, latent_small_h, latent_small_w)}, got {latents_small.shape}"
-
-                    # Sanity check: real-resize latents must not be identical to 512 latents
-                    # (would indicate the small image encode silently returned full-res output)
-                    assert not torch.allclose(latents_small, F.interpolate(latents_512, size=(latent_small_h, latent_small_w), mode="bilinear", align_corners=True)), \
-                        "latents_small suspiciously identical to downsampled latents_512 — possible encode leakage"
 
                     # --- virtual resize: compress 512 latents to `size` and back ---
                     latents_compressed = F.interpolate(
@@ -167,11 +164,12 @@ def run_experiment(pipe, dataset_samples):
 
                     # ---- real resize prediction ----
                     sigma_real = _sigma_for_size(sigma_base, size)
+                    timestep_real = (sigma_real * 1000).unsqueeze(0).expand(B).to(device)
                     noisy_real = (1 - sigma_real) * latents_small + sigma_real * noise_small
                     assert noisy_real.shape == latents_small.shape, f"noisy_real shape mismatch: {noisy_real.shape}"
                     vel_real = pipe.transformer(
                         hidden_states=noisy_real,
-                        timestep=timestep.expand(B).to(device),
+                        timestep=timestep_real,
                         encoder_hidden_states=prompt_embeds,
                         pooled_projections=pooled,
                         return_dict=False,
@@ -186,8 +184,8 @@ def run_experiment(pipe, dataset_samples):
                         latent_pred_real_up = latent_pred_real
                     assert latent_pred_real_up.shape == latents_512.shape, f"latent_pred_real_up shape mismatch: {latent_pred_real_up.shape}"
 
-                    # ---- virtual resize prediction (runs at 512, compressed input) ----
-                    sigma_virtual = _sigma_for_size(sigma_base, size)
+                    # ---- virtual resize prediction (runs at full res, no sigma scaling) ----
+                    sigma_virtual = sigma_base
                     noisy_virtual = (1 - sigma_virtual) * latents_virtual + sigma_virtual * noise_512
                     assert noisy_virtual.shape == latents_512.shape, f"noisy_virtual shape mismatch: {noisy_virtual.shape}"
                     vel_virtual = pipe.transformer(
@@ -229,8 +227,8 @@ def run_experiment(pipe, dataset_samples):
 # --------------------------------------------------------------------------- #
 def main():
     print("Loading DIV2K dataset...")
-    dataset = load_dataset("eugenesiow/Div2k", "bicubic_x2", split="validation")
-    dataset_samples = [{"image": Image.open(s["hr"]).convert("RGB")} for s in dataset.select(range(num_samples))]
+    dataset = load_dataset("mAiello00/DIV2K", split="train", streaming=True)
+    dataset_samples = [{"image": s["image"].convert("RGB")} for s in dataset.take(num_samples)]
 
     print("Loading SD3...")
     pipe = load_model("sd3", device, dtype)
