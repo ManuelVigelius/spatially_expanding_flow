@@ -41,3 +41,30 @@ def get_img_noise(batch_size: int, start_index: int = 0, device="cpu", latent_c:
         )
         noise_list.append(noise)
     return torch.cat(noise_list, dim=0).to(device)
+
+
+_NUM_IMAGENET_CLASSES = 1000
+
+
+def get_class_labels(batch_size: int, start_index: int = 0) -> torch.Tensor:
+    """
+    Generate reproducible random ImageNet class labels for a batch of images.
+
+    Each label is derived independently from seed = start_index + i, so the
+    label for image i is always the same regardless of batch size.
+
+    Args:
+        batch_size: Number of labels to return.
+        start_index: Global index of the first image in this batch.
+
+    Returns:
+        Long tensor of shape [batch_size] with values in [0, 999].
+    """
+    labels = []
+    for i in range(batch_size):
+        seed = start_index + i
+        generator = torch.Generator(device="cpu")
+        generator.manual_seed(seed)
+        label = torch.randint(_NUM_IMAGENET_CLASSES, (1,), generator=generator)
+        labels.append(label)
+    return torch.cat(labels, dim=0)

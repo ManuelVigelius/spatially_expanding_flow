@@ -29,20 +29,12 @@ import torch.nn.functional as F
 from datasets import load_dataset
 from tqdm import tqdm
 
-from models import encode_prompt_for_model, load_model
+from models import encode_prompt, encode_image, predict, load_model, downsample_latents, upsample_latents
 
 # --------------------------------------------------------------------------- #
 # Config
 # --------------------------------------------------------------------------- #
-if torch.cuda.is_available():
-    device = "cuda"
-    dtype = torch.bfloat16
-elif torch.backends.mps.is_available():
-    device = "mps"
-    dtype = torch.bfloat16
-else:
-    device = "cpu"
-    dtype = torch.float32
+from config import device, dtype
 
 num_inference_steps = 50
 num_samples = 64
@@ -86,12 +78,9 @@ def run_experiment(pipe, dataset_samples):
     pipe.scheduler.set_timesteps(num_inference_steps)
     pipe.transformer.eval()
 
-    sf = pipe.vae.config.shift_factor
-    sc = pipe.vae.config.scaling_factor
-
-    # Encode prompts once (empty prompt for all)
+    # Encode empty prompt once (shared for all samples/sizes/timesteps)
     with torch.no_grad():
-        prompt_embeds_1, pooled_1 = encode_prompt_for_model(pipe, "sd3", "", device, dtype)
+        prompt_data = encode_prompt(pipe, "sd3", "", device, dtype)
 
     results = {size: defaultdict(list) for size in image_sizes}
 
@@ -103,55 +92,22 @@ def run_experiment(pipe, dataset_samples):
     for size in tqdm(image_sizes, desc="sizes"):
         for batch in tqdm(batches, desc=f"  batches (size={size})", leave=False):
             B = len(batch)
-            prompt_embeds = prompt_embeds_1.expand(B, -1, -1)
-            pooled = pooled_1.expand(B, -1)
-
             with torch.no_grad():
                 # --- full resolution latents (shared reference) ---
                 images_512 = torch.cat([_to_tensor(s["image"], FULL_SIZE) for s in batch], dim=0)
                 assert images_512.shape == (B, 3, FULL_SIZE, FULL_SIZE), f"Expected images_512 {(B, 3, FULL_SIZE, FULL_SIZE)}, got {images_512.shape}"
-                latents_512 = (pipe.vae.encode(images_512).latent_dist.sample() - sf) * sc
+                latents_512 = encode_image(pipe, "sd3", images_512)
                 assert latents_512.shape == (B, 16, FULL_LATENT_SIZE, FULL_LATENT_SIZE), f"Expected latents_512 {(B, 16, FULL_LATENT_SIZE, FULL_LATENT_SIZE)}, got {latents_512.shape}"
 
                 latent_spatial = latents_512.shape[2:]  # (FULL_LATENT_SIZE, FULL_LATENT_SIZE)
 
-                if size < FULL_SIZE:
-                    latent_small_h = size // 8
-                    latent_small_w = size // 8
+                latent_small_h = size // 8
 
-                    # --- real resize: downsample full-res latents to `size` ---
-                    latents_small = F.interpolate(
-                        latents_512,
-                        size=(latent_small_h, latent_small_w),
-                        mode="bilinear",
-                        align_corners=True,
-                    )
-                    assert latents_small.shape == (B, 16, latent_small_h, latent_small_w), f"Expected latents_small {(B, 16, latent_small_h, latent_small_w)}, got {latents_small.shape}"
+                # --- real resize: downsample full-res latents to `size` ---
+                latents_small = downsample_latents(latents_512, latent_small_h)
 
-                    # --- virtual resize: compress 512 latents to `size` and back ---
-                    latents_compressed = F.interpolate(
-                        latents_512,
-                        size=(latent_small_h, latent_small_w),
-                        mode="bilinear",
-                        align_corners=True,
-                    )
-                    assert latents_compressed.shape == (B, 16, latent_small_h, latent_small_w), f"Expected latents_compressed {(B, 16, latent_small_h, latent_small_w)}, got {latents_compressed.shape}"
-                    latents_virtual = F.interpolate(
-                        latents_compressed,
-                        size=latent_spatial,
-                        mode="bilinear",
-                        align_corners=True,
-                    )
-                    assert latents_virtual.shape == latents_512.shape, f"Expected latents_virtual {latents_512.shape}, got {latents_virtual.shape}"
-
-                    # Sanity check: compression must actually lose information (not be a no-op)
-                    assert not torch.allclose(latents_virtual, latents_512), \
-                        "latents_virtual identical to latents_512 — compression had no effect"
-                else:
-                    latent_small_h = FULL_LATENT_SIZE
-                    latent_small_w = FULL_LATENT_SIZE
-                    latents_small = latents_512
-                    latents_virtual = latents_512
+                # --- virtual resize: compress 512 latents to `size` and back ---
+                latents_virtual = upsample_latents(downsample_latents(latents_512, latent_small_h), latent_spatial)
 
                 for t_idx in t_indices:
                     t_idx_int = t_idx.item()
@@ -164,51 +120,24 @@ def run_experiment(pipe, dataset_samples):
 
                     # ---- real resize prediction ----
                     sigma_real = _sigma_for_size(sigma_base, size)
-                    timestep_real = (sigma_real * 1000).unsqueeze(0).expand(B).to(device)
                     noisy_real = (1 - sigma_real) * latents_small + sigma_real * noise_small
                     assert noisy_real.shape == latents_small.shape, f"noisy_real shape mismatch: {noisy_real.shape}"
-                    vel_real = pipe.transformer(
-                        hidden_states=noisy_real,
-                        timestep=timestep_real,
-                        encoder_hidden_states=prompt_embeds,
-                        pooled_projections=pooled,
-                        return_dict=False,
-                    )[0]
+                    vel_real = predict(pipe, "sd3", noisy_real, sigma_real * 1000, prompt_data)
                     assert vel_real.shape == latents_small.shape, f"vel_real shape mismatch: {vel_real.shape}"
                     latent_pred_real = noisy_real - vel_real * sigma_real  # [B, C, h, w]
-                    if size < FULL_SIZE:
-                        latent_pred_real_up = F.interpolate(
-                            latent_pred_real, size=latent_spatial, mode="bilinear", align_corners=True
-                        )
-                    else:
-                        latent_pred_real_up = latent_pred_real
+                    latent_pred_real_up = upsample_latents(latent_pred_real, latent_spatial)
                     assert latent_pred_real_up.shape == latents_512.shape, f"latent_pred_real_up shape mismatch: {latent_pred_real_up.shape}"
 
                     # ---- virtual resize prediction (runs at full res, no sigma scaling) ----
                     sigma_virtual = sigma_base
                     noisy_virtual = (1 - sigma_virtual) * latents_virtual + sigma_virtual * noise_512
                     assert noisy_virtual.shape == latents_512.shape, f"noisy_virtual shape mismatch: {noisy_virtual.shape}"
-                    vel_virtual = pipe.transformer(
-                        hidden_states=noisy_virtual,
-                        timestep=timestep.expand(B).to(device),
-                        encoder_hidden_states=prompt_embeds,
-                        pooled_projections=pooled,
-                        return_dict=False,
-                    )[0]
+                    vel_virtual = predict(pipe, "sd3", noisy_virtual, timestep, prompt_data)
                     assert vel_virtual.shape == latents_512.shape, f"vel_virtual shape mismatch: {vel_virtual.shape}"
                     latent_pred_virtual = noisy_virtual - vel_virtual * sigma_virtual  # [B, C, 64, 64]
-                    if size < FULL_SIZE:
-                        latent_pred_virtual = F.interpolate(
-                            F.interpolate(
-                                latent_pred_virtual,
-                                size=(latent_small_h, latent_small_w),
-                                mode="bilinear",
-                                align_corners=True,
-                            ),
-                            size=latent_spatial,
-                            mode="bilinear",
-                            align_corners=True,
-                        )
+                    latent_pred_virtual = upsample_latents(
+                        downsample_latents(latent_pred_virtual, latent_small_h), latent_spatial
+                    )
                     assert latent_pred_virtual.shape == latents_512.shape, f"latent_pred_virtual shape mismatch: {latent_pred_virtual.shape}"
 
                     for b in range(B):

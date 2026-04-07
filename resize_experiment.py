@@ -18,20 +18,12 @@ import torch.nn.functional as F
 from datasets import load_dataset
 from tqdm import tqdm
 
-from models import encode_prompt_for_model, load_model
+from models import encode_prompt, encode_image, predict, load_model, downsample_latents, upsample_latents
 
 # --------------------------------------------------------------------------- #
 # Config
 # --------------------------------------------------------------------------- #
-if torch.cuda.is_available():
-    device = "cuda"
-    dtype = torch.bfloat16
-elif torch.backends.mps.is_available():
-    device = "mps"
-    dtype = torch.bfloat16
-else:
-    device = "cpu"
-    dtype = torch.float32
+from config import device, dtype
 
 num_inference_steps = 50
 num_samples = 64
@@ -61,11 +53,10 @@ def _process_sample(sample, size):
     return image
 
 
-def _encode_samples(pipe, samples, sf, sc):
+def _encode_samples(pipe, samples):
     """VAE-encode a list of samples at 512, return ref latents batched."""
     images = torch.cat([_process_sample(s, 512) for s in samples], dim=0)
-    latents = (pipe.vae.encode(images).latent_dist.sample() - sf) * sc
-    return latents
+    return encode_image(pipe, "sd3", images)
 
 
 def run_resize_experiment(pipe, dataset_samples):
@@ -89,9 +80,6 @@ def run_resize_experiment(pipe, dataset_samples):
     lat_results = defaultdict(lambda: defaultdict(list))
     upl_results = defaultdict(lambda: defaultdict(list))
 
-    sf = pipe.vae.config.shift_factor
-    sc = pipe.vae.config.scaling_factor
-
     batches = [
         dataset_samples[i : i + batch_size]
         for i in range(0, len(dataset_samples), batch_size)
@@ -99,30 +87,17 @@ def run_resize_experiment(pipe, dataset_samples):
 
     # Encode empty prompt once — same for all samples/sizes/timesteps
     with torch.no_grad():
-        prompt_embeds_1, pooled_1 = encode_prompt_for_model(pipe, "sd3", "", device, dtype)
+        prompt_data = encode_prompt(pipe, "sd3", "", device, dtype)
 
     for size in tqdm(image_sizes, desc="SD3 resize experiment"):
         with torch.no_grad():
             for batch in batches:
                 B = len(batch)
 
-                ref_latents = _encode_samples(pipe, batch, sf, sc)
+                ref_latents = _encode_samples(pipe, batch)
                 latent_spatial = ref_latents.shape[2:]  # (64, 64)
 
-                if size != 512:
-                    latent_small_size = size // 8
-                    latents = F.interpolate(
-                        ref_latents,
-                        size=(latent_small_size, latent_small_size),
-                        mode="bilinear",
-                        align_corners=True,
-                    )
-                else:
-                    latents = ref_latents
-
-                # Tile prompt embeddings to match batch size
-                prompt_embeds = prompt_embeds_1.expand(B, -1, -1)
-                pooled = pooled_1.expand(B, -1)
+                latents = downsample_latents(ref_latents, size // 8)
 
                 for t_idx in t_indices:
                     t_idx_int = t_idx.item()
@@ -130,19 +105,13 @@ def run_resize_experiment(pipe, dataset_samples):
                     if SCALE_SIGMA_BY_SIZE:
                         r = size / 512
                         sigma = (r * sigma) / (r * sigma + (1 - sigma))
-                    timestep = (sigma * 1000).unsqueeze(0).expand(B).to(device)
+                    timestep = (sigma * 1000).expand(B).to(device)
 
                     noise = torch.randn_like(latents)
                     noisy = (1 - sigma) * latents + sigma * noise
                     target = noise - latents
 
-                    vel = pipe.transformer(
-                        hidden_states=noisy,
-                        timestep=timestep,
-                        encoder_hidden_states=prompt_embeds,
-                        pooled_projections=pooled,
-                        return_dict=False,
-                    )[0]
+                    vel = predict(pipe, "sd3", noisy, timestep[0], prompt_data)
 
                     latent_pred = noisy - vel * sigma
                     for b in range(B):
@@ -153,12 +122,7 @@ def run_resize_experiment(pipe, dataset_samples):
                             F.mse_loss(latent_pred[b], latents[b]).item()
                         )
 
-                    if size != 512:
-                        upsampled_pred = F.interpolate(
-                            latent_pred, size=latent_spatial, mode="bilinear", align_corners=True
-                        )
-                    else:
-                        upsampled_pred = latent_pred
+                    upsampled_pred = upsample_latents(latent_pred, latent_spatial)
                     for b in range(B):
                         upl_results[size][t_idx_int].append(
                             F.mse_loss(upsampled_pred[b], ref_latents[b]).item()
