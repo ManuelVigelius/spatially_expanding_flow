@@ -1,24 +1,33 @@
 """
 Generate 10k images with DiT-XL-2 using DDIM (10 steps) for FID evaluation.
 
-Two conditions are compared:
-  - full:    every denoising step runs at 512px
-  - optimal: step sizes follow the 50%-budget optimal schedule from optimal_schedules.json
+Five hand-written size schedules are compared, each run with both
+virtual resize and actual resize, for a total of 10 conditions.
 
-Classes are sampled uniformly at random from [0, 999] (ImageNet-1k).
-CFG scale is 4.0 (null class = 1000).
+Schedules (10 steps, index 0 = noisiest, index 9 = cleanest):
+  full        — all steps at 512px (baseline)
+  early_small — 256px for first 5 noisy steps, then 512px
+  late_small  — 512px for first 5 steps, then 256px for last 5
+  gradual     — linearly ramp from 128px up to 512px
+  aggressive  — 128px for first 7 noisy steps, then 512px for last 3
+
+For each schedule, two resize modes are run:
+  actual  — model runs at target resolution; x0 upsampled back to 512
+  virtual — model always runs at 512px on a blurred (down→up) latent
+
+Classes are sampled uniformly from [0, 999] (ImageNet-1k), 10 per class.
+CFG scale is 4.0. All images saved as PNGs; results bundled into a zip.
 
 Images are saved as PNGs under:
-  results/fid_images/full/
-  results/fid_images/optimal/
+  results/fid_images/<schedule_name>_<mode>/
+A final zip is written to:
+  results/fid_images.zip
 """
 
-import json
 import os
+import zipfile
 
-import numpy as np
 import torch
-import torch.nn.functional as F
 from PIL import Image
 from tqdm import tqdm
 
@@ -28,20 +37,28 @@ from models import encode_prompt, load_model, predict, downsample_latents, upsam
 # ---------------------------------------------------------------------------
 # Parameters
 # ---------------------------------------------------------------------------
-N_IMAGES = 10_000
+N_IMAGES = 32
 BATCH_SIZE = 32
 N_STEPS = 10
 CFG_SCALE = 4.0
-BUDGET_PCT = 50  # which schedule to use from optimal_schedules.json
-SCHEDULES_PATH = "optimal_schedules.json"
 OUT_DIR = "results/fid_images"
-SEED = 42
+ZIP_PATH = "results/fid_images.zip"
+SEED = 0
 
-# If True, the model always runs at 512px but latents are blurred via downsample→upsample
-# before each forward pass (virtual resize). The x0 prediction and re-noising still
-# happen at full 512-latent resolution.
-# If False, the model runs at the target resolution (actual resize).
-VIRTUAL_RESIZE = False
+# If True, sample class labels uniformly at random (seeded by SEED).
+# If False, use deterministic labels: 10 images per class, all 1000 classes.
+RANDOM_CLASSES = True
+
+# ---------------------------------------------------------------------------
+# Hand-written schedules (pixel sizes, one per denoising step, noisiest first)
+# ---------------------------------------------------------------------------
+SCHEDULES: dict[str, list[int]] = {
+    "full":           [512, 512, 512, 512, 512, 512, 512, 512, 512, 512],
+    "early_small":    [256, 256, 256, 256, 256, 512, 512, 512, 512, 512],
+    "gradual_mild":   [256, 256, 320, 320, 384, 384, 448, 448, 512, 512],
+    "gradual_medium": [192, 192, 256, 256, 320, 384, 448, 448, 512, 512],
+    "gradual_steep":  [128, 128, 128, 192, 256, 320, 384, 448, 512, 512],
+}
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -68,6 +85,7 @@ def generate_batch(
     class_labels: list[int],
     size_schedule: list[int],
     timesteps: torch.Tensor,
+    virtual_resize: bool,
 ) -> list[Image.Image]:
     """
     Generate one batch of images using the given per-step size schedule.
@@ -80,6 +98,7 @@ def generate_batch(
 
     size_schedule: list of pixel sizes, one per denoising step (length = N_STEPS).
     timesteps: 1-D tensor of DDPM timestep indices, descending (noisy->clean).
+    virtual_resize: if True, model always runs at 512px on a blurred (down→up) latent.
     """
     B = len(class_labels)
     prompt_data = encode_prompt(pipe, "dit", class_labels, device, dtype)
@@ -92,13 +111,13 @@ def generate_batch(
     # Bootstrap: noise a zero x0 to t=timesteps[0] to get the starting noisy latent
     t0 = timesteps[0]
     a0 = get_alpha(pipe, t0)
-    latents = a0 * torch.zeros_like(eps) + (1 - a0 ** 2).sqrt() * eps  # = sqrt(1-alpha) * eps
+    latents = a0 * torch.zeros_like(eps) + (1 - a0 ** 2).sqrt() * eps
 
     for step_idx, (t, size) in enumerate(zip(timesteps, size_schedule)):
         lat_size = size // 8
         a_t = get_alpha(pipe, t)
 
-        if VIRTUAL_RESIZE:
+        if virtual_resize:
             # Model always runs at 512px on a blurred (downsample→upsample) latent
             latents_input = upsample_latents(downsample_latents(latents, lat_size), latent_size)
             noise_pred = predict(pipe, "dit", latents_input, t, prompt_data, guidance_scale=CFG_SCALE)
@@ -128,62 +147,55 @@ def generate_batch(
 def main() -> None:
     torch.manual_seed(SEED)
 
-    # Load schedules
-    with open(SCHEDULES_PATH) as f:
-        data = json.load(f)
-    t_values = data["t_values"]          # list of t_idx values (length = N_STEPS_ORIG)
-    optimal_sizes = data["schedules"][str(BUDGET_PCT)]  # one size per original step
-
-    # We run DDIM with N_STEPS steps; use the scheduler to get evenly-spaced timesteps.
     pipe = load_model("dit", device, dtype)
-
-    # DiT already uses DDIMScheduler; set_timesteps is called per-batch in the loop.
-    # Do one set_timesteps here just to determine the timestep-to-size mapping.
     pipe.scheduler.set_timesteps(N_STEPS)
+    timesteps = pipe.scheduler.timesteps
 
-    # t_values are indices into the 50-step scheduler (0=clean, 49=most noisy).
-    # optimal_sizes is stored in the same ascending order (index 0 = clean step).
-    # DDIM timesteps are DDPM-scale integers descending (noisy→clean, e.g. 900→0).
-    # Convert each DDIM timestep to a 0-49 index and look up the size directly.
-    t_values_arr = np.array(t_values)                   # ascending 0..49
-    max_t_value = float(t_values_arr.max())             # 49
-    max_ddim_t = float(pipe.scheduler.timesteps[0])     # e.g. 900 for 10 steps
-    ddim_ts = pipe.scheduler.timesteps.cpu().numpy()    # descending, length N_STEPS
-    size_schedule = []
-    for t in ddim_ts:
-        t_idx = round(t / max_ddim_t * max_t_value)
-        nearest = int(np.argmin(np.abs(t_values_arr - t_idx)))
-        size_schedule.append(optimal_sizes[nearest])
+    print("DDIM timesteps:", timesteps.tolist())
+    print(f"Running {len(SCHEDULES)} schedules x 2 modes = {len(SCHEDULES) * 2} conditions\n")
 
-    full_size_schedule = [512] * N_STEPS
+    if RANDOM_CLASSES:
+        rng = torch.Generator().manual_seed(SEED)
+        all_classes = torch.randint(0, 1000, (N_IMAGES,), generator=rng).tolist()
+    else:
+        # 10 images per class, 1000 classes = 10k images total
+        all_classes = [c for c in range(1000) for _ in range(10)]
 
-    print(f"Optimal size schedule ({BUDGET_PCT}% budget): {size_schedule}")
-    print(f"DDIM timesteps: {ddim_ts.tolist()}")
+    generated_dirs: list[str] = []
 
-    mode = "virtual" if VIRTUAL_RESIZE else "actual"
-    conditions = {
-        "full": full_size_schedule,
-        f"optimal_{mode}": size_schedule,
-    }
+    for sched_name, size_schedule in SCHEDULES.items():
+        for virtual_resize in (False, True):
+            mode = "virtual" if virtual_resize else "actual"
+            cond_name = f"{sched_name}_{mode}"
+            out_dir = os.path.join(OUT_DIR, cond_name)
+            os.makedirs(out_dir, exist_ok=True)
+            generated_dirs.append(out_dir)
 
-    # 10 images per class, 1000 classes = 10k images total
-    all_classes = [c for c in range(1000) for _ in range(10)]
+            print(f"Generating {N_IMAGES} images [{cond_name}] schedule={size_schedule} -> {out_dir}")
 
-    for cond_name, sched in conditions.items():
-        out_dir = os.path.join(OUT_DIR, cond_name)
-        os.makedirs(out_dir, exist_ok=True)
-        print(f"\nGenerating {N_IMAGES} images [{cond_name}] -> {out_dir}")
+            torch.manual_seed(SEED)  # same noise for all conditions
+            img_idx = 0
+            for start in tqdm(range(0, N_IMAGES, BATCH_SIZE), desc=cond_name):
+                batch_classes = all_classes[start : start + BATCH_SIZE]
+                images = generate_batch(pipe, batch_classes, size_schedule, timesteps, virtual_resize)
+                for img in images:
+                    img.save(os.path.join(out_dir, f"{img_idx:05d}.png"))
+                    img_idx += 1
 
-        torch.manual_seed(SEED)  # same noise for both conditions
-        img_idx = 0
-        for start in tqdm(range(0, N_IMAGES, BATCH_SIZE)):
-            batch_classes = all_classes[start : start + BATCH_SIZE]
-            images = generate_batch(pipe, batch_classes, sched, pipe.scheduler.timesteps)
-            for img in images:
-                img.save(os.path.join(out_dir, f"{img_idx:05d}.png"))
-                img_idx += 1
+    # Bundle all generated images into a single zip
+    os.makedirs(os.path.dirname(ZIP_PATH), exist_ok=True)
+    print(f"\nBundling images into {ZIP_PATH} ...")
+    with zipfile.ZipFile(ZIP_PATH, "w", compression=zipfile.ZIP_STORED) as zf:
+        for dir_path in generated_dirs:
+            cond_name = os.path.basename(dir_path)
+            for fname in sorted(os.listdir(dir_path)):
+                if fname.endswith(".png"):
+                    zf.write(
+                        os.path.join(dir_path, fname),
+                        arcname=os.path.join(cond_name, fname),
+                    )
 
-    print("\nDone.")
+    print(f"Done. Zip written to {ZIP_PATH}")
 
 
 if __name__ == "__main__":
