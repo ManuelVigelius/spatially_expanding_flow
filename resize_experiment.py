@@ -59,6 +59,21 @@ def load_samples(dataset_name, n):
     ]
 
 
+def _is_flow_matching(scheduler):
+    return hasattr(scheduler, "sigmas")
+
+
+def _get_sigmas(scheduler):
+    """Return a 1-D flow-matching sigma tensor (only valid for flow-matching schedulers)."""
+    return scheduler.sigmas
+
+
+def _get_alphas(scheduler):
+    """Return sqrt_alpha and sqrt_one_minus_alpha at each scheduled timestep (DDPM/DDIM)."""
+    ac = scheduler.alphas_cumprod[scheduler.timesteps.cpu()].to(device=device, dtype=dtype)
+    return ac.sqrt(), (1 - ac).sqrt()
+
+
 def _get_prompt(batch):
     """Return the prompt argument for encode_prompt given the current MODEL and batch."""
     if MODEL == "dit":
@@ -85,7 +100,6 @@ def run_resize_experiment(pipe, dataset_samples):
     """
     For every image size and every timestep, downsample 512 latents to `size`,
     add noise, run the model, and record:
-      - velocity MSE          (in latent space, at native size)
       - latent MSE            (predicted latent vs. ground-truth latent, both at native size)
       - upsampled_latent MSE  (predicted latent bilinearly upsampled to 512-latent size vs. ground-truth latents at 512)
 
@@ -97,8 +111,12 @@ def run_resize_experiment(pipe, dataset_samples):
     """
     pipe.scheduler.set_timesteps(num_inference_steps)
     pipe.transformer.eval()
+    flow_matching = _is_flow_matching(pipe.scheduler)
+    if flow_matching:
+        sigmas = _get_sigmas(pipe.scheduler)
+    else:
+        sqrt_alphas, sqrt_one_minus_alphas = _get_alphas(pipe.scheduler)
 
-    vel_results = defaultdict(lambda: defaultdict(list))
     lat_results = defaultdict(lambda: defaultdict(list))
     upl_results = defaultdict(lambda: defaultdict(list))
 
@@ -122,23 +140,25 @@ def run_resize_experiment(pipe, dataset_samples):
 
                 for t_idx in t_indices:
                     t_idx_int = t_idx.item()
-                    sigma = pipe.scheduler.sigmas[t_idx_int].to(dtype=dtype)
-                    if SCALE_SIGMA_BY_SIZE:
-                        r = size / 512
-                        sigma = (r * sigma) / (r * sigma + (1 - sigma))
-                    timestep = (sigma * 1000).expand(B).to(device)
-
                     noise = torch.randn_like(latents)
-                    noisy = (1 - sigma) * latents + sigma * noise
-                    target = noise - latents
 
-                    vel = predict(pipe, MODEL, noisy, timestep[0], prompt_data, guidance_scale=CFG_SCALE)
-
-                    latent_pred = noisy - vel * sigma
+                    if flow_matching:
+                        sigma = sigmas[t_idx_int].to(dtype=dtype)
+                        if SCALE_SIGMA_BY_SIZE:
+                            r = size / 512
+                            sigma = (r * sigma) / (r * sigma + (1 - sigma))
+                        timestep = (sigma * 1000).expand(B).to(device)
+                        noisy = (1 - sigma) * latents + sigma * noise
+                        pred = predict(pipe, MODEL, noisy, timestep[0], prompt_data, guidance_scale=CFG_SCALE)
+                        latent_pred = noisy - pred * sigma
+                    else:
+                        sa = sqrt_alphas[t_idx_int]
+                        sb = sqrt_one_minus_alphas[t_idx_int]
+                        timestep = pipe.scheduler.timesteps[t_idx_int].expand(B).to(device)
+                        noisy = sa * latents + sb * noise
+                        pred = predict(pipe, MODEL, noisy, timestep[0], prompt_data, guidance_scale=CFG_SCALE)
+                        latent_pred = (noisy - sb * pred) / sa
                     for b in range(B):
-                        vel_results[size][t_idx_int].append(
-                            F.mse_loss(vel[b], target[b]).item()
-                        )
                         lat_results[size][t_idx_int].append(
                             F.mse_loss(latent_pred[b], latents[b]).item()
                         )
@@ -149,7 +169,7 @@ def run_resize_experiment(pipe, dataset_samples):
                             F.mse_loss(upsampled_pred[b], ref_latents[b]).item()
                         )
 
-    return {"velocity": vel_results, "latent": lat_results, "upsampled_latent": upl_results}
+    return {"latent": lat_results, "upsampled_latent": upl_results}
 
 
 # --------------------------------------------------------------------------- #
