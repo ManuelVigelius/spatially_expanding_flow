@@ -118,10 +118,14 @@ def generate_batch(
         a_t = get_alpha(pipe, t)
 
         if virtual_resize:
-            # Model always runs at 512px on a blurred (downsample→upsample) latent
-            latents_input = upsample_latents(downsample_latents(latents, lat_size), latent_size)
+            # Extract clean x0 estimate from the current noisy latent using the known eps,
+            # blur it via downsample→upsample, then re-noise back to t before the forward pass.
+            x0_est = (latents - (1 - a_t ** 2).sqrt() * eps) / a_t
+            x0_blurred = upsample_latents(downsample_latents(x0_est, lat_size), latent_size)
+            latents_input = a_t * x0_blurred + (1 - a_t ** 2).sqrt() * eps
             noise_pred = predict(pipe, "dit", latents_input, t, prompt_data, guidance_scale=CFG_SCALE)
             x0_full = (latents_input - (1 - a_t ** 2).sqrt() * noise_pred) / a_t
+            x0_full = upsample_latents(downsample_latents(x0_full, lat_size), latent_size)
         else:
             # Model runs at target resolution; x0 is upsampled back to 512 afterwards
             latents_small = downsample_latents(latents, lat_size)
