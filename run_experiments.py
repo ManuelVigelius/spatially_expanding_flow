@@ -155,12 +155,12 @@ def run_virtual_resize(pipe, model_name, dataset_samples, args):
 
     Returns:
         {
-            "velocity_compress_output":   {t_idx: {size: [float, ...]}},
-            "latent_compress_output":     {t_idx: {size: [float, ...]}},
-            "velocity_compress_targets":  {t_idx: {size: [float, ...]}},
-            "latent_compress_targets":    {t_idx: {size: [float, ...]}},
-            "velocity_no_compress":       {t_idx: {size: [float, ...]}},
-            "latent_no_compress":         {t_idx: {size: [float, ...]}},
+            "velocity_compress_output":  {t_idx: {size: [float, ...]}},
+            "latent_compress_output":    {t_idx: {size: [float, ...]}},
+            "velocity_compress_targets": {t_idx: {size: [float, ...]}},
+            "latent_compress_targets":   {t_idx: {size: [float, ...]}},
+            "velocity_no_compress":      {t_idx: {size: [float, ...]}},
+            "latent_no_compress":        {t_idx: {size: [float, ...]}},
         }
     """
     t_indices = torch.linspace(0, args.num_inference_steps - 1, args.num_t_indices).long()
@@ -178,13 +178,6 @@ def run_virtual_resize(pipe, model_name, dataset_samples, args):
     lat_comp_tgt  = nested_defaultdict()
     vel_no_comp   = nested_defaultdict()
     lat_no_comp   = nested_defaultdict()
-    # zero-prediction baselines (same conditions, predicted vel/noise = 0)
-    vel_zero_comp_out  = nested_defaultdict()
-    lat_zero_comp_out  = nested_defaultdict()
-    vel_zero_comp_tgt  = nested_defaultdict()
-    lat_zero_comp_tgt  = nested_defaultdict()
-    vel_zero_no_comp   = nested_defaultdict()
-    lat_zero_no_comp   = nested_defaultdict()
 
     for sample in tqdm(dataset_samples, desc=f"{model_name} virtual resize"):
         with torch.no_grad():
@@ -222,58 +215,37 @@ def run_virtual_resize(pipe, model_name, dataset_samples, args):
                         vel = predict(pipe, model_name, noisy, timestep, prompt_data)
                         latent_pred = noisy - vel * sigma
                         noise_pred  = noisy + vel * (1 - sigma)
-                        # zero-prediction baselines: vel=0 -> latent_pred=noisy, noise_pred=noisy
-                        latent_zero = noisy
-                        noise_zero  = noisy
                     else:
                         noisy = sa * compressed + sb * noise
                         eps = predict(pipe, model_name, noisy, timestep, prompt_data)
                         latent_pred = (noisy - sb * eps) / sa
                         noise_pred  = eps
-                        # zero-prediction baselines: eps=0 -> latent_pred=noisy/sa, noise_pred=0
-                        latent_zero = noisy / sa
-                        noise_zero  = torch.zeros_like(eps)
 
                     vel_target_down  = downsample_latents(vel_target, size)
                     latents_down     = downsample_latents(latents, size)
 
                     # condition 1: re-compress output, compare vs full-res GT
                     latent_pred_comp = apply_spatial_compression(latent_pred, size)
-                    latent_zero_comp = apply_spatial_compression(latent_zero, size)
                     vel_comp_out[t_idx_int][size].append(mse(noise_pred, vel_target))
                     lat_comp_out[t_idx_int][size].append(mse(latent_pred_comp, latents))
-                    vel_zero_comp_out[t_idx_int][size].append(mse(noise_zero, vel_target))
-                    lat_zero_comp_out[t_idx_int][size].append(mse(latent_zero_comp, latents))
 
                     # condition 2: compress targets, compare downsampled output vs downsampled GT
                     noise_pred_down  = downsample_latents(noise_pred, size)
                     latent_pred_down = downsample_latents(latent_pred, size)
-                    noise_zero_down  = downsample_latents(noise_zero, size)
-                    latent_zero_down = downsample_latents(latent_zero, size)
                     vel_comp_tgt[t_idx_int][size].append(mse(noise_pred_down, vel_target_down))
                     lat_comp_tgt[t_idx_int][size].append(mse(latent_pred_down, latents_down))
-                    vel_zero_comp_tgt[t_idx_int][size].append(mse(noise_zero_down, vel_target_down))
-                    lat_zero_comp_tgt[t_idx_int][size].append(mse(latent_zero_down, latents_down))
 
                     # condition 3: no output compression, compare raw output vs full-res GT
                     vel_no_comp[t_idx_int][size].append(mse(noise_pred, vel_target))
                     lat_no_comp[t_idx_int][size].append(mse(latent_pred, latents))
-                    vel_zero_no_comp[t_idx_int][size].append(mse(noise_zero, vel_target))
-                    lat_zero_no_comp[t_idx_int][size].append(mse(latent_zero, latents))
 
     return {
-        "velocity_compress_output":       defaultdict_to_dict(vel_comp_out),
-        "latent_compress_output":         defaultdict_to_dict(lat_comp_out),
-        "velocity_compress_targets":      defaultdict_to_dict(vel_comp_tgt),
-        "latent_compress_targets":        defaultdict_to_dict(lat_comp_tgt),
-        "velocity_no_compress":           defaultdict_to_dict(vel_no_comp),
-        "latent_no_compress":             defaultdict_to_dict(lat_no_comp),
-        "velocity_zero_compress_output":  defaultdict_to_dict(vel_zero_comp_out),
-        "latent_zero_compress_output":    defaultdict_to_dict(lat_zero_comp_out),
-        "velocity_zero_compress_targets": defaultdict_to_dict(vel_zero_comp_tgt),
-        "latent_zero_compress_targets":   defaultdict_to_dict(lat_zero_comp_tgt),
-        "velocity_zero_no_compress":      defaultdict_to_dict(vel_zero_no_comp),
-        "latent_zero_no_compress":        defaultdict_to_dict(lat_zero_no_comp),
+        "velocity_compress_output":  defaultdict_to_dict(vel_comp_out),
+        "latent_compress_output":    defaultdict_to_dict(lat_comp_out),
+        "velocity_compress_targets": defaultdict_to_dict(vel_comp_tgt),
+        "latent_compress_targets":   defaultdict_to_dict(lat_comp_tgt),
+        "velocity_no_compress":      defaultdict_to_dict(vel_no_comp),
+        "latent_no_compress":        defaultdict_to_dict(lat_no_comp),
     }
 
 

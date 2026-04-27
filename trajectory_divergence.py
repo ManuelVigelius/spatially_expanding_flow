@@ -95,12 +95,16 @@ def get_alpha(pipe, t: torch.Tensor) -> torch.Tensor:
     return ac[t].sqrt().view(1, 1, 1, 1)
 
 
-def decode_latents(pipe, latents: torch.Tensor) -> list[Image.Image]:
+def decode_latents(pipe, latents: torch.Tensor, batch_size: int = 8) -> list[Image.Image]:
     latents = latents / pipe.vae.config.scaling_factor
-    images = pipe.vae.decode(latents, return_dict=False)[0]
-    images = (images.clamp(-1, 1) + 1) / 2
-    images = (images * 255).byte().permute(0, 2, 3, 1).cpu().numpy()
-    return [Image.fromarray(img) for img in images]
+    images = []
+    for i in range(0, latents.shape[0], batch_size):
+        chunk = latents[i : i + batch_size]
+        decoded = pipe.vae.decode(chunk, return_dict=False)[0]
+        decoded = (decoded.clamp(-1, 1) + 1) / 2
+        decoded = (decoded * 255).byte().permute(0, 2, 3, 1).cpu().numpy()
+        images.extend(Image.fromarray(img) for img in decoded)
+    return images
 
 
 # ---------------------------------------------------------------------------
@@ -121,7 +125,7 @@ def run_baseline(pipe, timesteps: torch.Tensor) -> dict:
             "final_latents": [B, 4, 64, 64] fully denoised latent
         }
     """
-    B = N_CLASSES
+    B = len(CLASS_LABELS)
     prompt_data = encode_prompt(pipe, "dit", CLASS_LABELS, device, dtype)
     latent_size = 64  # 512 // 8
 
@@ -136,11 +140,11 @@ def run_baseline(pipe, timesteps: torch.Tensor) -> dict:
 
     for step_idx, t in enumerate(tqdm(timesteps, desc="Baseline")):
         a_t = get_alpha(pipe, t)
-        noisy_latents.append(latents.clone())
+        noisy_latents.append(latents.cpu())
 
         noise_pred = predict(pipe, "dit", latents, t, prompt_data, guidance_scale=CFG_SCALE)
         x0 = (latents - (1 - a_t ** 2).sqrt() * noise_pred) / a_t
-        x0s.append(x0.clone())
+        x0s.append(x0.cpu())
 
         if step_idx + 1 < len(timesteps):
             t_next = timesteps[step_idx + 1]
@@ -189,7 +193,7 @@ def run_perturbed(
             "divergence":   list of per-step MSE vs baseline x0
         }
     """
-    B = N_CLASSES
+    B = len(CLASS_LABELS)
     prompt_data = encode_prompt(pipe, "dit", CLASS_LABELS, device, dtype)
     latent_size = 64
     comp_lat_size = compression_size // 8
@@ -198,7 +202,7 @@ def run_perturbed(
     eps = baseline["eps"]
 
     # Get x0 at injection step, compress it
-    x0_inject = baseline["x0s"][injection_step_idx]  # [B, 4, 64, 64]
+    x0_inject = baseline["x0s"][injection_step_idx].to(device=device, dtype=dtype)  # [B, 4, 64, 64]
     x0_compressed = upsample_latents(
         downsample_latents(x0_inject, comp_lat_size), latent_size
     )
@@ -226,7 +230,7 @@ def run_perturbed(
         step_indices.append(step_idx)
 
         # Divergence: MSE vs baseline x0 at the same step
-        baseline_x0 = baseline["x0s"][step_idx]
+        baseline_x0 = baseline["x0s"][step_idx].to(device=device, dtype=dtype)
         mse = F.mse_loss(x0.float(), baseline_x0.float()).item()
         divergences.append(mse)
 

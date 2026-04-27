@@ -359,6 +359,7 @@ def main() -> None:
                         arcname=os.path.join(cond_name, fname),
                     )
 
+    zf.write(METADATA_PATH, arcname="metadata.json")
     print(f"Done. Zip written to {ZIP_PATH}")
 
 

@@ -204,14 +204,16 @@ def predict(pipe, model_name, latents, timestep, prompt_data, guidance_scale=1.0
         raise ValueError(f"Unknown model: {model_name}")
 
 
-def downsample_latents(latents, size):
-    """Bilinearly downsample latents [B, C, H, W] to the given square spatial size.
+def downsample_latents(latents, size, mode="area"):
+    """Downsample latents [B, C, H, W] to the given square spatial size.
 
-    No-op if the latents are already at that size.
+    No-op if the latents are already at that size. Uses area interpolation by
+    default; pass mode="bilinear" for bilinear interpolation.
     """
     if latents.shape[2] == size and latents.shape[3] == size:
         return latents
-    return F.interpolate(latents, size=(size, size), mode="bilinear", align_corners=True)
+    kwargs = {} if mode == "area" else {"align_corners": True}
+    return F.interpolate(latents, size=(size, size), mode=mode, **kwargs)
 
 
 def upsample_latents(latents, size):
@@ -229,10 +231,10 @@ def upsample_latents(latents, size):
     return F.interpolate(latents, size=size, mode="bilinear", align_corners=True)
 
 
-def apply_spatial_compression(latents, target_size):
+def apply_spatial_compression(latents, target_size, downsample_mode="area"):
     """Downsample then upsample latents to simulate a virtual resize."""
     original_size = latents.shape[2:]
-    return upsample_latents(downsample_latents(latents, target_size), original_size)
+    return upsample_latents(downsample_latents(latents, target_size, mode=downsample_mode), original_size)
 
 
 # --------------------------------------------------------------------------- #
